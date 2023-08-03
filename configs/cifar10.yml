@@ -33,7 +33,7 @@ diffusion:
     beta_start: 0.0001
     beta_end: 0.02
     num_diffusion_timesteps: 1000
-    truncated_timestep: 499
+    truncated_timestep: 99
 
 training:
     batch_size: 128
@@ -45,6 +45,7 @@ training:
 sampling:
     batch_size: 64
     last_only: True
+    ckpt_id: 200000
 
 optim:
     weight_decay: 0.000

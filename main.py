@@ -97,6 +97,8 @@ def parse_args_and_config():
     with open(os.path.join("configs", args.config), "r") as f:
         config = yaml.safe_load(f)
     new_config = dict2namespace(config)
+    new_config.imagelog_path = os.path.join(args.exp, "image_logs", args.doc)
+    os.makedirs(new_config.imagelog_path, exist_ok=True)
 
     tb_path = os.path.join(args.exp, "tensorboard", args.doc)
 
@@ -218,7 +220,10 @@ def main():
 
     try:
         runner = Diffusion(args, config)
-        runner.train()
+        if args.sample:
+            runner.sample()
+        else:
+            runner.train()
     except Exception:
         logging.error(traceback.format_exc())
 
