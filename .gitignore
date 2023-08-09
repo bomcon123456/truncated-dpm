@@ -165,3 +165,5 @@ tmp
 gan
 cifar10v2
 *.pth
+*.png
+*.jpg

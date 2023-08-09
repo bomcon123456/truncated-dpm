@@ -5,13 +5,12 @@ import glob
 import sys
 import copy
 from pathlib import Path
+p = Path(__file__)
+rootdir = p.parent.parent
+stylegandir = rootdir / "stylegan"
+print(stylegandir)
+sys.path.append(stylegandir.as_posix())
 
-sys.path.append(
-    "/lustre/scratch/client/guardpro/trungdt21/research/face_gen/truncated-diffusion-probabilistic-models/stylegan2-ada-pytorch"
-)
-sys.path.append(
-    "/lustre/scratch/client/guardpro/trungdt21/research/face_gen/truncated-diffusion-probabilistic-models/"
-)
 
 import numpy as np
 import tqdm
@@ -550,7 +549,7 @@ class Diffusion(object):
         model = Model(self.config)
 
         states = torch.load(
-            self.config.ckpt_path,
+            self.config.denoise.ckpt_path,
             map_location=self.config.device,
         )
         model = model.to(self.device)
@@ -573,16 +572,39 @@ class Diffusion(object):
         outpath.mkdir(exist_ok=True, parents=True)
         with torch.no_grad():
             for image_path in tqdm.tqdm(
-                config.denoise.image_paths
+                self.config.denoise.image_paths
             ):
                 image = PIL.Image.open(image_path)
                 image = test_transform(image)
-                denoised_image = self.sample_image(model, image)
-                denoised_image = inverse_data_transform(config, denoised_image)
+                image = image.to(self.device)
+                image = data_transform(self.config, image)[None, ...]
+                if self.config.denoise.raw_image:
+                    image = self.noise(image)
+                    tvu.save_image(
+                        image, (outpath / f"{image_path.stem}_noised.png")
+                    )
+                flipped_image = torch.flip(image, [3])
+                denoised_image = self.sample_image(image, model)
+                denoised_image = inverse_data_transform(self.config, denoised_image)
+
+                denoised_flipped_image = self.sample_image(flipped_image, model)
+                denoised_flipped_image = inverse_data_transform(self.config, denoised_flipped_image)
                 tvu.save_image(
                     denoised_image, (outpath / f"{image_path.stem}.png")
                 )
+                tvu.save_image(
+                    denoised_flipped_image, (outpath / f"{image_path.stem}_flipped.png")
+                )
                 
+    def noise(self, image, step=None):
+        if step is None:
+            t_max = torch.tensor([self.truncated_timestep]).to(self.device)
+        else:
+            t_max = torch.tensor([step]).to(self.device)
+        print(f"Step: {t_max}")
+        return q_sample(
+            image, self.alphas_bar_sqrt, self.one_minus_alphas_bar_sqrt, t_max
+        )
 
 if __name__ == "__main__":
     G = create_gan()
