@@ -1,3 +1,6 @@
+gan:
+    cfg: "stylegan2"
+
 data:
     dataset: "CIFAR10"
     image_size: 32

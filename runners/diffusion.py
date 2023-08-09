@@ -3,16 +3,23 @@ import logging
 import time
 import glob
 import sys
+import copy
 from pathlib import Path
 
-sys.path.append("/lustre/scratch/client/guardpro/trungdt21/research/face_gen/truncated-diffusion-probabilistic-models/stylegan2-ada-pytorch")
-sys.path.append("/lustre/scratch/client/guardpro/trungdt21/research/face_gen/truncated-diffusion-probabilistic-models/")
+sys.path.append(
+    "/lustre/scratch/client/guardpro/trungdt21/research/face_gen/truncated-diffusion-probabilistic-models/stylegan2-ada-pytorch"
+)
+sys.path.append(
+    "/lustre/scratch/client/guardpro/trungdt21/research/face_gen/truncated-diffusion-probabilistic-models/"
+)
 
 import numpy as np
 import tqdm
 import torch
 import torch.nn as nn
 import torch.utils.data as data
+import torchvision.transforms as transforms
+import PIL
 
 from models.diffusion import Model, Discriminator
 from models.ema import EMAHelper
@@ -21,6 +28,9 @@ from functions.losses import loss_registry
 from functions.denoising import generalized_steps
 from datasets import get_dataset, data_transform, inverse_data_transform
 from functions.ckpt_util import get_ckpt_path
+
+# stylegan module
+from train import setup_GAN_kwargs
 
 import torchvision.utils as tvu
 import matplotlib.pyplot as plt
@@ -32,11 +42,12 @@ from torch_utils.ops import conv2d_gradfix
 # stylegan2 lib
 import dnnlib
 
-plt.rcParams["savefig.bbox"] = 'tight'
+plt.rcParams["savefig.bbox"] = "tight"
 
-#-------------------------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------------------------
 # from stylegan2 training_loop: https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/training_loop.py
-#-------------------------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------------------------
+
 
 def save_image_grid(img, fname, drange, grid_size):
     lo, hi = drange
@@ -52,9 +63,10 @@ def save_image_grid(img, fname, drange, grid_size):
 
     assert C in [1, 3]
     if C == 1:
-        PIL.Image.fromarray(img[:, :, 0], 'L').save(fname)
+        PIL.Image.fromarray(img[:, :, 0], "L").save(fname)
     if C == 3:
-        PIL.Image.fromarray(img, 'RGB').save(fname)
+        PIL.Image.fromarray(img, "RGB").save(fname)
+
 
 def torch2hwcuint8(x, clip=False):
     if clip:
@@ -95,35 +107,54 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
     assert betas.shape == (num_diffusion_timesteps,)
     return betas
 
+
 def extract(input, t, x):
     shape = x.shape
     out = torch.gather(input, 0, t.to(input.device))
     reshape = [t.shape[0]] + [1] * (len(shape) - 1)
     return out.reshape(*reshape)
 
+
 def q_sample(x_0, alphas_bar_sqrt, one_minus_alphas_bar_sqrt, t, noise=None):
     if noise is None:
         noise = torch.randn_like(x_0).to(x_0.device)
     alphas_t = extract(alphas_bar_sqrt, t, x_0)
     alphas_1_m_t = extract(one_minus_alphas_bar_sqrt, t, x_0)
-    return (alphas_t * x_0 + alphas_1_m_t * noise)
+    return alphas_t * x_0 + alphas_1_m_t * noise
+
 
 def create_gan(img_size):
-    G_kwargs = dnnlib.EasyDict(class_name='training.networks.Generator', z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict(), synthesis_kwargs=dnnlib.EasyDict())
+    G_kwargs = dnnlib.EasyDict(
+        class_name="training.networks.Generator",
+        z_dim=512,
+        w_dim=512,
+        mapping_kwargs=dnnlib.EasyDict(),
+        synthesis_kwargs=dnnlib.EasyDict(),
+    )
     res = img_size
     map = 2
-    #fmaps = 1 if res >= 512 else 0.5
+    # fmaps = 1 if res >= 512 else 0.5
     fmaps = 1
     gan_lrate = 0.025
     G_kwargs.synthesis_kwargs.channel_base = int(fmaps * 32768)
     G_kwargs.synthesis_kwargs.channel_max = 512
     G_kwargs.mapping_kwargs.num_layers = map
-    G_kwargs.synthesis_kwargs.num_fp16_res = 4 # enable mixed-precision training
-    G_kwargs.synthesis_kwargs.conv_clamp = 256 # clamp activations to avoid float16 overflow
-    G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=gan_lrate, betas=[0,0.99], eps=1e-8)
+    G_kwargs.synthesis_kwargs.num_fp16_res = 4  # enable mixed-precision training
+    G_kwargs.synthesis_kwargs.conv_clamp = (
+        256  # clamp activations to avoid float16 overflow
+    )
+    G_opt_kwargs = dnnlib.EasyDict(
+        class_name="torch.optim.Adam", lr=gan_lrate, betas=[0, 0.99], eps=1e-8
+    )
     common_kwargs = dict(c_dim=0, img_resolution=res, img_channels=3)
-    G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(True).to("cuda:0") # subclass of torch.nn.Module
+    G = (
+        dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs)
+        .train()
+        .requires_grad_(True)
+        .to("cuda:0")
+    )  # subclass of torch.nn.Module
     return G
+
 
 class Diffusion(object):
     def __init__(self, args, config, device=None):
@@ -181,10 +212,35 @@ class Diffusion(object):
         )
         model = Model(config)
 
-        discriminator = Discriminator(c_dim=0, img_resolution=config.data.image_size, img_channels=config.data.channels, channel_base=config.discriminator.channel_base)
+        discriminator = Discriminator(
+            c_dim=0,
+            img_resolution=config.data.image_size,
+            img_channels=config.data.channels,
+            channel_base=config.discriminator.channel_base,
+        )
 
-        # Only support CIFAR-10 StyleGan for now.
-        generator = create_gan(img_size=config.data.image_size)
+        # generator = create_gan(img_size=config.data.image_size)
+        generator_kwargs = setup_GAN_kwargs(
+            gpus=1,
+            # Dataset.
+            label_dim=0,
+            # Base config.
+            cfg=config.gan.cfg,  # Base config: 'auto' (default), 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar'
+            gamma=None,  # Override R1 gamma: <float>
+            nobench=None,  # Disable cuDNN benchmarking: <bool>, default = False
+        )
+        common_kwargs = dict(
+            c_dim=generator_kwargs.label_dim,
+            img_resolution=config.data.image_size,
+            img_channels=config.data.channels,
+        )
+        generator = (
+            dnnlib.util.construct_class_by_name(**generator_kwargs.G_kwargs, **common_kwargs)
+            .train()
+            .requires_grad_(False)
+            .to(self.device)
+        )  # subclass of torch.nn.Module
+        generator_ema = copy.deepcopy(generator).eval()
 
         model = model.to(self.device)
         model = torch.nn.DataParallel(model)
@@ -269,45 +325,72 @@ class Diffusion(object):
                 optimizer_g.zero_grad()
                 loss_T.backward()
                 optimizer_g.step()
-                
+
+                # Update G_EMA
+                ema_nimg = generator_kwargs.ema_kimg * 1000
+                ema_beta = 0.5 ** (config.training.batch_size / max(ema_nimg, 1e-8))
+                for p_ema, p in zip(generator_ema.parameters(), generator.parameters()):
+                    p_ema.copy_(p.lerp(p_ema, ema_beta))
+                for b_ema, b in zip(generator_ema.buffers(), generator.buffers()):
+                    b_ema.copy_(b)
+
+                # update discriminator
                 discriminator.requires_grad_(True)
                 generator.requires_grad_(False)
-                # update discriminator
-                do_Dr1 = (i % self.Dreg_interval == 0)
+                optimizer_d.zero_grad()
+
+                do_Dr1 = ((step % self.Dreg_interval) == 0)
                 z_si = torch.randn([x.shape[0], generator.z_dim], device=self.device)
                 # z_si = torch.randn_like(x).to(self.device)
-                x_t_implicit = q_sample(x, self.alphas_bar_sqrt, self.one_minus_alphas_bar_sqrt, t_max).detach().requires_grad_(do_Dr1)
-                
+                x_t_implicit = (
+                    q_sample(
+                        x, self.alphas_bar_sqrt, self.one_minus_alphas_bar_sqrt, t_max
+                    )
+                    .detach()
+                    .requires_grad_(do_Dr1)
+                )
+
                 x_t_gen_implicit = generator(z_si, label)
-                
-                real_logits = discriminator(x_t_implicit, c=0)
-                loss_Dreal = torch.nn.functional.softplus(-real_logits).mean()
-                tb_logger.add_scalar("Dloss/Dreal", loss_Dreal, global_step=step)
+
                 gen_logits = discriminator(x_t_gen_implicit, c=0)
                 loss_Dgen = torch.nn.functional.softplus(gen_logits).mean()
-                tb_logger.add_scalar("Dloss/Dgen", loss_Dgen, global_step=step)
+                loss_Dgen.backward()
+                tb_logger.add_scalar("DLoss/Dgen", loss_Dgen, global_step=step)
+
+                real_logits = discriminator(x_t_implicit, c=0)
+                loss_Dreal = torch.nn.functional.softplus(-real_logits).mean()
+                if not do_Dr1:
+                    loss_Dreal.backward()
+                tb_logger.add_scalar("DLoss/Dreal", loss_Dreal, global_step=step)
+
 
                 loss_Dr1 = 0
                 if do_Dr1:
-                    with torch.autograd.profiler.record_function('r1_grads'), conv2d_gradfix.no_weight_gradients():
-                        r1_grads = torch.autograd.grad(outputs=[real_logits.sum()], inputs=[x_t_implicit], create_graph=True, only_inputs=True)[0]
-                    r1_penalty = r1_grads.square().sum([1,2,3])
+                    with torch.autograd.profiler.record_function(
+                        "r1_grads"
+                    ), conv2d_gradfix.no_weight_gradients():
+                        r1_grads = torch.autograd.grad(
+                            outputs=[real_logits.sum()],
+                            inputs=[x_t_implicit],
+                            create_graph=True,
+                            only_inputs=True,
+                        )[0]
+                    r1_penalty = r1_grads.square().sum([1, 2, 3])
                     loss_Dr1 = (r1_penalty * (self.r1_gamma / 2)).mean()
-                    tb_logger.add_scalar('DLoss/r1_penalty', r1_penalty.mean())
-                    tb_logger.add_scalar('DLoss/reg', loss_Dr1)
+                    (loss_Dreal + loss_Dr1.mul(self.Dreg_interval)).backward()
+                    tb_logger.add_scalar("DLoss/r1_penalty", r1_penalty.mean(), global_step=step)
+                    tb_logger.add_scalar("DLoss/reg", loss_Dr1, global_step=step)
 
-                d_loss = loss_Dreal + loss_Dgen + loss_Dr1
+                # d_loss = loss_Dreal + loss_Dgen + loss_Dr1
 
-                optimizer_d.zero_grad()
-                d_loss.backward()
-                optimizer_d.step() 
-
-                
+                # d_loss.backward()
+                optimizer_d.step()
 
                 if step % self.config.training.snapshot_freq == 0 or step == 1:
                     states = [
                         model.state_dict(),
                         generator.state_dict(),
+                        generator_ema.state_dict(),
                         optimizer.state_dict(),
                         optimizer_d.state_dict(),
                         optimizer_g.state_dict(),
@@ -323,20 +406,47 @@ class Diffusion(object):
                     )
                     torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
 
-
                 data_start = time.time()
 
             image_save_folder = Path(self.config.imagelog_path)
-            tvu.save_image(x_t_gen_implicit, (image_save_folder /  f"xgen_{epoch}.jpg").as_posix(), normalize=True)
-            tvu.save_image(x_t_implicit, (image_save_folder / f"xreal_{epoch}.jpg"), normalize=True)
+            tvu.save_image(
+                x_t_implicit.detach().cpu(), (image_save_folder / f"xreal_{epoch}.jpg"), normalize=True
+            )
+            with torch.no_grad():
+                x_t_gen_implicit_ema = generator_ema(z_si, label)
+                tvu.save_image(
+                    x_t_gen_implicit_ema.detach().cpu(),
+                    (image_save_folder / f"xgen_{epoch}.jpg").as_posix(),
+                    normalize=True,
+                )
 
             logging.info(
-                    f"Epoch: {epoch}, epoch training time: {time.time() - epoch_start_time}"
-                )
+                f"Epoch: {epoch}, epoch training time: {time.time() - epoch_start_time}"
+            )
 
     def sample(self):
         model = Model(self.config)
-        generator = create_gan(img_size=self.config.data.image_size)
+
+        generator_kwargs = setup_GAN_kwargs(
+            gpus=1,
+            # Dataset.
+            label_dim=0,
+            # Base config.
+            cfg=self.config.gan.cfg,  # Base config: 'auto' (default), 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar'
+            gamma=None,  # Override R1 gamma: <float>
+            nobench=None,  # Disable cuDNN benchmarking: <bool>, default = False
+        )
+        common_kwargs = dict(
+            c_dim=generator_kwargs.label_dim,
+            img_resolution=self.config.data.image_size,
+            img_channels=self.config.data.channels,
+        )
+        generator = (
+            dnnlib.util.construct_class_by_name(**generator_kwargs.G_kwargs, **common_kwargs)
+            .train()
+            .requires_grad_(False)
+            .to(self.device)
+        )  # subclass of torch.nn.Module
 
         states = torch.load(
             os.path.join(
@@ -347,7 +457,7 @@ class Diffusion(object):
         model = model.to(self.device)
         model = torch.nn.DataParallel(model)
         model.load_state_dict(states[0], strict=True)
-        generator.load_state_dict(states[1], strict=True)
+        generator.load_state_dict(states[2], strict=True)
 
         if self.config.model.ema:
             ema_helper = EMAHelper(mu=self.config.model.ema_rate)
@@ -364,7 +474,7 @@ class Diffusion(object):
             self.sample_fid(model, generator)
         else:
             raise NotImplementedError("Sample procedeure not defined")
-        
+
     def sample_fid(self, model, generator):
         config = self.config
         img_id = len(glob.glob(f"{self.args.image_folder}/*"))
@@ -388,15 +498,22 @@ class Diffusion(object):
                 # )
 
                 x = generator(x, label)
+                # flipped_x = torch.flip(x, [3])
+
                 x = self.sample_image(x, model)
                 x = inverse_data_transform(config, x)
+
+                # flipped_x = self.sample_image(flipped_x, model)
+                # flipped_x = inverse_data_transform(config, flipped_x)
 
                 for i in range(n):
                     tvu.save_image(
                         x[i], os.path.join(self.args.image_folder, f"{img_id}.png")
                     )
+                    # tvu.save_image(
+                    #     flipped_x[i], os.path.join(self.args.image_folder, f"{img_id}_flipped.png")
+                    # )
                     img_id += 1
-
 
     def sample_image(self, x, model, last=True):
         seq = range(0, self.truncated_timestep)
@@ -406,7 +523,67 @@ class Diffusion(object):
             x = x[0][-1]
         return x
 
-    
+    def generate_truncated(self):
+        args, config = self.args, self.config
+        dataset, test_dataset = get_dataset(args, config)
+        train_loader = data.DataLoader(
+            dataset,
+            batch_size=config.training.batch_size,
+            shuffle=False,
+            num_workers=config.data.num_workers,
+            drop_last=False,
+        )
+        outpath = Path(config.generate_truncated.outpath)
+        outpath.mkdir(exist_ok=True, parents=True)
+        t_max = torch.tensor([self.truncated_timestep])
+        for i, (x, y) in enumerate(tqdm.tqdm(train_loader)):
+            x_noised = q_sample(
+                x, self.alphas_bar_sqrt, self.one_minus_alphas_bar_sqrt, t_max
+            )
+            # x_noised = inverse_data_transform(config, x_noised)
+            for j in range(x.shape[0]):
+                tvu.save_image(
+                    x_noised[j], (outpath / f"{str(i*config.training.batch_size + j).zfill(8)}.png")
+                )
+        
+    def denoise(self):
+        model = Model(self.config)
+
+        states = torch.load(
+            self.config.ckpt_path,
+            map_location=self.config.device,
+        )
+        model = model.to(self.device)
+        model = torch.nn.DataParallel(model)
+        model.load_state_dict(states[0], strict=True)
+
+        if self.config.model.ema:
+            ema_helper = EMAHelper(mu=self.config.model.ema_rate)
+            ema_helper.register(model)
+            ema_helper.load_state_dict(states[-1])
+            ema_helper.ema(model)
+        else:
+            ema_helper = None
+
+        model.eval()
+        test_transform = transforms.Compose(
+            [transforms.Resize(self.config.data.image_size), transforms.ToTensor()]
+        )
+        outpath = self.config.denoise.out_path
+        outpath.mkdir(exist_ok=True, parents=True)
+        with torch.no_grad():
+            for image_path in tqdm.tqdm(
+                config.denoise.image_paths
+            ):
+                image = PIL.Image.open(image_path)
+                image = test_transform(image)
+                denoised_image = self.sample_image(model, image)
+                denoised_image = inverse_data_transform(config, denoised_image)
+                tvu.save_image(
+                    denoised_image, (outpath / f"{image_path.stem}.png")
+                )
+                
+
 if __name__ == "__main__":
     G = create_gan()
     print(G)

@@ -8,6 +8,7 @@ import os
 import torch
 import numpy as np
 import torch.utils.tensorboard as tb
+from torch_utils.ops import conv2d_gradfix
 
 from runners.diffusion import Diffusion
 
@@ -46,6 +47,11 @@ def parse_args_and_config():
     parser.add_argument("--test", action="store_true", help="Whether to test the model")
     parser.add_argument(
         "--sample",
+        action="store_true",
+        help="Whether to produce samples from the model",
+    )
+    parser.add_argument(
+        "--generate_truncated",
         action="store_true",
         help="Whether to produce samples from the model",
     )
@@ -197,6 +203,7 @@ def parse_args_and_config():
         torch.cuda.manual_seed_all(args.seed)
 
     torch.backends.cudnn.benchmark = True
+    conv2d_gradfix.enabled = True
 
     return args, new_config
 
@@ -222,6 +229,8 @@ def main():
         runner = Diffusion(args, config)
         if args.sample:
             runner.sample()
+        if args.generate_truncated:
+            runner.generate_truncated()
         else:
             runner.train()
     except Exception:

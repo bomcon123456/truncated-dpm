@@ -36,7 +36,7 @@ diffusion:
     beta_start: 0.0001
     beta_end: 0.02
     num_diffusion_timesteps: 1000
-    truncated_timestep: 99
+    truncated_timestep: 499
 
 training:
     batch_size: 128
@@ -48,7 +48,7 @@ training:
 sampling:
     batch_size: 32
     last_only: True
-    ckpt_id: 245000
+    ckpt_id: 170000
 
 optim:
     weight_decay: 0.000
@@ -71,7 +71,4 @@ optim_d:
   
 generate_truncated:
     n_samples: -1
-    outpath: /lustre/scratch/client/guardpro/trungdt21/research/face_gen/data/celeb64_99
-
-denoise:
-    ckpt_path: "/lustre/scratch/client/guardpro/trungdt21/research/face_gen/truncated-diffusion-probabilistic-models/pretrained/celeba64/ckpt.pth"
+    outpath: /lustre/scratch/client/guardpro/trungdt21/research/face_gen/data/celeb64_499
